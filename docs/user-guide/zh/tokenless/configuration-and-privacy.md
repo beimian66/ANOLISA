@@ -149,6 +149,7 @@ adapter 分类：文件读取工具的结果透传；shell 工具的结果附带
 | `TOKENLESS_SLS_PATH` | 覆盖 SLS JSONL 路径 | 必须位于 `/var/log/` 或 `/tmp/` 下 |
 | `TOKENLESS_DIFF_COMPRESSION_ENABLED` | 启用 Git Diff 上下文裁剪 | 默认关闭；`1`、`true`、`yes` 启用；不覆盖 SDK 参数 |
 | `TOKENLESS_HTML_EXTRACTION_ENABLED` | HTML 页面转写开关 | 默认开启；`1`、`true`、`yes` 开启，其他非空值关闭；不覆盖 SDK 参数 |
+| `TOKENLESS_MIXED_CONTENT_ENABLED` | 混合内容区域压缩开关 | 默认关闭；`1`、`true`、`yes` 启用；不覆盖 SDK 参数 |
 
 ### Adapter 和诊断变量
 

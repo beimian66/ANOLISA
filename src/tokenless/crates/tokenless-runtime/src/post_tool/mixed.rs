@@ -1,0 +1,621 @@
+//! Typed-region recognition for mixed-content tool outputs.
+//!
+//! A mixed output is prose, headers, or logs surrounding structured
+//! regions: fenced code blocks and bracket-delimited JSON documents embedded
+//! in surrounding text. Recognition is conservative and structural only —
+//! a region exists when an explicit, verifiable boundary marks it, never
+//! because its shape merely looks like data. Full-input parsing stays inside
+//! the domain compressors, exactly as for standalone documents, and a region
+//! the compressor rejects is preserved verbatim.
+
+use tokenless_ccr::{RecoveryMethod, StashStore};
+use tokenless_compressors::{
+    JsonCompressionContext, JsonCompressor, Recoverability, TabularCompressor,
+};
+use tokenless_protocol::AppliedOperation;
+
+use super::content::{MAX_SCAN_LINES, scan_prefix};
+use super::pipeline::PostToolPipelineConfig;
+
+/// The compression domain a region routes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegionKind {
+    Json,
+    Tabular,
+}
+
+/// Per-region compression results for one mixed-content candidate.
+pub(crate) struct MixedResult {
+    /// Reconstructed output with compressed regions in place.
+    pub(crate) output: String,
+    /// Wire operations across all compressed regions, in region order.
+    pub(crate) operations: Vec<AppliedOperation>,
+    /// Weakest region recoverability.
+    pub(crate) recoverability: Recoverability,
+    /// Stash writes from every region.
+    pub(crate) stash_writes: Vec<tokenless_ccr::StashWrite>,
+    /// Failed stash writes across regions.
+    pub(crate) stash_errors: usize,
+    /// Unrecoverable truncations from a JSON region that truncated, summed
+    /// across regions under the same attribution rule as the standalone
+    /// JSON route.
+    pub(crate) unrecoverable_truncations: Option<usize>,
+}
+
+/// Compresses recognized regions of a mixed output and reconstructs the
+/// whole content with unchanged bytes around them.
+///
+/// Each region runs its own domain compressor under the same configuration
+/// the standalone route would use. A region the compressor rejects (invalid
+/// JSON, malformed table, no per-region savings) stays byte-for-byte, so a
+/// misrecognized boundary can never corrupt the surrounding document. A
+/// fenced JSON region that selected TOON has its fence label updated to
+/// `toon` together with its body, keeping representation metadata consistent
+/// with the applied transformation.
+///
+/// Returns `None` when no region changed: the arbiter would reject an
+/// operation-free candidate, so the caller routes to passthrough directly.
+pub(crate) fn compress_regions(
+    content: &str,
+    config: &PostToolPipelineConfig,
+    stash: Option<&dyn StashStore>,
+    recovery: &RecoveryMethod,
+    allow_toon: bool,
+) -> Option<MixedResult> {
+    let json_compressor = JsonCompressor::new(config.json.clone());
+    let mut output = String::with_capacity(content.len());
+    let mut operations = Vec::new();
+    let mut recoverability = Recoverability::Lossless;
+    let mut stash_writes = Vec::new();
+    let mut stash_errors = 0usize;
+    let mut unrecoverable_truncations = 0usize;
+    let mut truncated = false;
+    let mut changed = false;
+    let mut cursor = 0usize;
+
+    for boundary in boundaries(content) {
+        // Compress first: whether the opening fence needs relabeling depends
+        // on the body's outcome. The prose before the fence and the fence
+        // line are separate slices — the label rewrite touches only the
+        // fence line, never the surrounding text.
+        output.push_str(&content[cursor..boundary.open_start]);
+        let fence_line = &content[boundary.open_start..boundary.open_end];
+        cursor = boundary.open_end;
+        let region = boundary.body;
+        enum Applied {
+            Json(tokenless_compressors::JsonOutcome),
+            Tabular(tokenless_compressors::TabularOutcome),
+        }
+        let outcome = match boundary.kind {
+            RegionKind::Json => {
+                let context = JsonCompressionContext {
+                    recovery,
+                    stash,
+                    allow_toon,
+                    min_toon_chars: config.min_toon_chars,
+                    allow_unrecoverable: !config.require_reversibility
+                        || !config.compression_enabled,
+                };
+                json_compressor
+                    .compress(region, &context)
+                    .ok()
+                    .filter(|outcome| outcome.output != region)
+                    .map(Applied::Json)
+            }
+            RegionKind::Tabular => {
+                let outcome = TabularCompressor.compress(region);
+                (!outcome.operations.is_empty() && outcome.output != region)
+                    .then_some(Applied::Tabular(outcome))
+            }
+        };
+        let toon = matches!(
+            &outcome,
+            Some(Applied::Json(outcome))
+                if outcome.operations.iter().any(|op| matches!(op, tokenless_compressors::JsonOperation::Toon))
+        );
+        match (boundary.fence_label, toon) {
+            // The fence label travels with the body: a JSON block that
+            // selected TOON is announced as `toon`, not `json`. Only the
+            // first info word (the language) is rewritten; any remaining
+            // attributes keep their text and position.
+            (Some(_), true) => output.push_str(&relabeled_fence_line(fence_line)),
+            _ => output.push_str(fence_line),
+        }
+        match outcome {
+            Some(Applied::Json(outcome)) => {
+                changed = true;
+                output.push_str(&outcome.output);
+                // Same operation attribution as the standalone JSON route:
+                // Cleanup is only emitted when compaction itself shaped the
+                // output, never alongside TOON.
+                for operation in &outcome.operations {
+                    match operation {
+                        tokenless_compressors::JsonOperation::Toon => {
+                            operations.push(AppliedOperation::Toon);
+                        }
+                        tokenless_compressors::JsonOperation::Truncation => {
+                            operations.push(AppliedOperation::JsonTruncation);
+                        }
+                        tokenless_compressors::JsonOperation::RecordReduction => {
+                            operations.push(AppliedOperation::JsonRecordReduction);
+                        }
+                        tokenless_compressors::JsonOperation::Cleanup => {
+                            operations.push(AppliedOperation::JsonCleanup);
+                        }
+                    }
+                }
+                recoverability = weakest(recoverability, outcome.recoverability);
+                stash_writes.extend(outcome.stash_writes);
+                stash_errors += outcome.metrics.stash_errors;
+                if outcome
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op, tokenless_compressors::JsonOperation::Truncation))
+                {
+                    truncated = true;
+                    unrecoverable_truncations += outcome.metrics.unrecoverable_truncations;
+                }
+            }
+            Some(Applied::Tabular(outcome)) => {
+                changed = true;
+                output.push_str(&outcome.output);
+                operations.push(AppliedOperation::TabularCompaction);
+                recoverability = weakest(recoverability, outcome.recoverability);
+            }
+            None => output.push_str(region),
+        }
+        cursor += region.len();
+    }
+    output.push_str(&content[cursor..]);
+    if !changed {
+        return None;
+    }
+    Some(MixedResult {
+        output,
+        operations,
+        recoverability,
+        stash_writes,
+        stash_errors,
+        unrecoverable_truncations: truncated.then_some(unrecoverable_truncations),
+    })
+}
+
+fn weakest(left: Recoverability, right: Recoverability) -> Recoverability {
+    use Recoverability::{Lossless, Retrievable, Unrecoverable};
+    match (left, right) {
+        (Unrecoverable, _) | (_, Unrecoverable) => Unrecoverable,
+        (Retrievable, _) | (_, Retrievable) => Retrievable,
+        _ => Lossless,
+    }
+}
+
+/// The opening fence line with only its info word replaced by `toon`.
+/// Leading indentation, the marker run, and any attributes after the
+/// language word are re-emitted unchanged.
+fn relabeled_fence_line(fence_line: &str) -> String {
+    let indent_len = fence_line
+        .len()
+        .saturating_sub(fence_line.trim_start_matches([' ', '\t']).len());
+    let (indent, rest) = fence_line.split_at(indent_len);
+    let marker_run = rest
+        .bytes()
+        .take_while(|byte| matches!(byte, b'`' | b'~'))
+        .count();
+    let info = rest[marker_run..].trim();
+    let mut relabeled = String::with_capacity(fence_line.len() + 1);
+    relabeled.push_str(indent);
+    relabeled.push_str(&rest[..marker_run]);
+    relabeled.push_str("toon");
+    let after_word = info
+        .split_ascii_whitespace()
+        .next()
+        .map_or("", |word| &info[word.len()..]);
+    let attributes = after_word.trim();
+    if !attributes.is_empty() {
+        relabeled.push(' ');
+        relabeled.push_str(attributes);
+    }
+    // Preserve the whitespace between marker and info word plus the trailing
+    // whitespace/newline the original line carried. Slicing from the info
+    // word's own offset keeps this byte-safe for non-ASCII leading blanks.
+    let info_offset =
+        marker_run + (rest[marker_run..].len() - rest[marker_run..].trim_start().len());
+    relabeled.push_str(&fence_line[info_offset + info.len()..]);
+    relabeled
+}
+
+/// Cheap precheck for the pipeline gate: does the content carry at least
+/// one region boundary a conservative recognizer would trust? A fenced
+/// block with a supported info word, or a line whose first non-space
+/// character opens a bracket-balanced document. Bounded like the other
+/// detectors: only the first [`MAX_SCAN_BYTES`] / [`MAX_SCAN_LINES`] are
+/// inspected.
+pub(crate) fn has_recognizable_regions(content: &str) -> bool {
+    for (indent, trimmed) in scan_lines_prefixed(content) {
+        if indent <= 3
+            && !trimmed.starts_with('\t')
+            && (opening_fence(trimmed).is_some()
+                || trimmed.starts_with('{')
+                || trimmed.starts_with('['))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Iterates the bounded scan window as `(indent, trimmed_line)` pairs,
+/// mirroring the budget [`super::content`] applies to every other detector:
+/// at most [`MAX_SCAN_BYTES`] and [`MAX_SCAN_LINES`] of input.
+fn scan_lines_prefixed(content: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+    scan_prefix(content)
+        .lines()
+        .take(MAX_SCAN_LINES)
+        .map(|line| {
+            let trimmed = line.trim_start_matches([' ', '\t']);
+            (line.len() - trimmed.len(), trimmed)
+        })
+}
+
+/// A line that opens a fence under CommonMark: at least three of one marker,
+/// indented at most three spaces (checked by the caller), with an info string
+/// free of backticks when the marker is a backtick. Returns the marker byte,
+/// the marker run length, and the info string.
+fn opening_fence(trimmed: &str) -> Option<(u8, usize, &str)> {
+    let marker = trimmed.as_bytes().first().copied()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let run = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    if run < 3 {
+        return None;
+    }
+    let info = trimmed[run..].trim();
+    (marker == b'~' || !info.contains('`')).then_some((marker, run, info))
+}
+
+/// Where one region starts and ends in the source, including the fence lines
+/// around a fenced body.
+struct Boundary<'a> {
+    /// Offset of the opening fence line, or of the JSON document when bare.
+    open_start: usize,
+    /// Offset just past the opening fence line (or at the JSON document).
+    open_end: usize,
+    /// The region body: fence-interior lines, or the JSON document text.
+    body: &'a str,
+    kind: RegionKind,
+    /// The fence info string of the opening line, when fenced.
+    fence_label: Option<&'a str>,
+}
+
+/// Walks the content once, yielding one [`Boundary`] per recognized region.
+///
+/// The walk is a single left-to-right pass over the bounded scan window with
+/// a persistent bracket state: a bare-JSON opener keeps its depth state across
+/// lines instead of rescanning from every candidate, so any input costs
+/// O(bytes + lines) — the same budget the other detectors observe.
+fn boundaries(content: &str) -> Vec<Boundary<'_>> {
+    let prefix = scan_prefix(content);
+    let bytes = prefix.as_bytes();
+    let mut boundaries = Vec::new();
+    let mut cursor = 0;
+    let mut lines = 0usize;
+    // A bare document opened on a candidate line: its byte state lives until
+    // the document balances or the walk ends. Each byte feeds it exactly once.
+    let mut doc: Option<OpenDoc> = None;
+    while let Some(line_end) = next_line_end(bytes, cursor) {
+        if let Some(mut state) = doc.take() {
+            // The document spans this line: feed its bytes to the balance
+            // state until it closes or the line ends.
+            if let Some((body, after)) = state.feed(prefix, line_end) {
+                boundaries.push(Boundary {
+                    open_start: state.start,
+                    open_end: state.start,
+                    body,
+                    kind: RegionKind::Json,
+                    fence_label: None,
+                });
+                cursor = after;
+            } else {
+                doc = Some(state);
+                cursor = line_end;
+            }
+            continue;
+        }
+        if lines >= MAX_SCAN_LINES {
+            break;
+        }
+        lines += 1;
+        let line = &prefix[cursor..line_end];
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indent = line.len() - trimmed.len();
+        if indent <= 3
+            && !trimmed.starts_with('\t')
+            && let Some((marker, run, info)) = opening_fence(trimmed)
+        {
+            if let Some(kind) = region_kind(info) {
+                // A supported fence that never closes protects its
+                // remainder: recognition stops here rather than
+                // treating the unterminated interior as regions.
+                let Some((body, after)) = close_fenced(prefix, line_end, marker, run) else {
+                    break;
+                };
+                boundaries.push(Boundary {
+                    open_start: cursor,
+                    open_end: line_end,
+                    body,
+                    kind,
+                    fence_label: Some(info),
+                });
+                cursor = after;
+                continue;
+            }
+            // A protected or unlabeled block: skip past its
+            // closing fence, or to the end when unclosed.
+            let (_, after) = close_any_fenced(prefix, line_end, marker, run);
+            cursor = after;
+            continue;
+        }
+        if indent <= 3
+            && !trimmed.starts_with('\t')
+            && (trimmed.starts_with('{') || trimmed.starts_with('['))
+        {
+            let mut state = OpenDoc::new(cursor + indent);
+            if let Some((body, after)) = state.feed(prefix, line_end) {
+                boundaries.push(Boundary {
+                    open_start: state.start,
+                    open_end: state.start,
+                    body,
+                    kind: RegionKind::Json,
+                    fence_label: None,
+                });
+                cursor = after;
+            } else {
+                doc = Some(state);
+                cursor = line_end;
+            }
+            continue;
+        }
+        cursor = line_end;
+    }
+    boundaries
+}
+
+/// The region bodies a scan recognizes, in order. A test-level view of
+/// [`boundaries`]; the reconstruction path works from boundaries directly.
+#[cfg(test)]
+pub(crate) fn regions(content: &str) -> Vec<(&str, RegionKind)> {
+    boundaries(content)
+        .into_iter()
+        .map(|boundary| (boundary.body, boundary.kind))
+        .collect()
+}
+
+fn next_line_end(bytes: &[u8], from: usize) -> Option<usize> {
+    bytes[from..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or((from < bytes.len()).then_some(bytes.len()), |index| {
+            Some(from + index + 1)
+        })
+}
+
+/// Returns the fence-interior body (excluding its final newline, which
+/// reconstruction keeps as the separator before the closing fence) and the
+/// offset just past the closing line. `None` when unclosed: the rest of the
+/// output stays inside the block. The scan is bounded by the byte window,
+/// not the candidate-line budget: once inside a recognized region the
+/// remaining work is one linear pass over at most [`MAX_SCAN_BYTES`] bytes.
+fn close_fenced(
+    content: &str,
+    body_start: usize,
+    marker: u8,
+    length: usize,
+) -> Option<(&str, usize)> {
+    let bytes = content.as_bytes();
+    let mut cursor = body_start;
+    while let Some(line_end) = next_line_end(bytes, cursor) {
+        let line = &content[cursor..line_end];
+        if is_closing_fence(line, marker, length) {
+            let body = &content[body_start..cursor];
+            let body = body
+                .strip_suffix("\r\n")
+                .or_else(|| body.strip_suffix('\n'))
+                .unwrap_or(body);
+            return Some((body, line_end));
+        }
+        cursor = line_end;
+    }
+    None
+}
+
+/// Same scan, but an unclosed fence ends at the byte window (used for
+/// protected blocks, which must be skipped without aborting recognition
+/// of later content).
+fn close_any_fenced(content: &str, body_start: usize, marker: u8, length: usize) -> (&str, usize) {
+    let bytes = content.as_bytes();
+    let mut cursor = body_start;
+    while let Some(line_end) = next_line_end(bytes, cursor) {
+        let line = &content[cursor..line_end];
+        if is_closing_fence(line, marker, length) {
+            return (&content[body_start..cursor], line_end);
+        }
+        cursor = line_end;
+    }
+    (&content[body_start..cursor], cursor)
+}
+
+/// A closing fence: at least `length` of the same marker, then only
+/// whitespace. Indented up to three spaces, matching the opening grammar.
+fn is_closing_fence(line: &str, marker: u8, length: usize) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    let run = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    indent <= 3 && run >= length && trimmed[run..].trim().is_empty()
+}
+
+/// The balance state of a bare JSON document that opened on a candidate
+/// line and may span further lines. Each byte of the content is fed to the
+/// state machine exactly once, so an opener that never balances costs one
+/// pass over its own lines, never a rescan per candidate.
+struct OpenDoc {
+    /// Offset of the opening bracket in the content.
+    start: usize,
+    /// Offset of the next byte the balance state has not consumed.
+    scan: usize,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl OpenDoc {
+    /// Opens a document whose first bracket sits at `start`.
+    fn new(start: usize) -> Self {
+        Self {
+            start,
+            scan: start,
+            depth: 0,
+            in_string: false,
+            escaped: false,
+        }
+    }
+
+    /// Feeds `content[scan..until]` to the state. Returns the document text
+    /// and the offset just past the line holding the closing bracket when
+    /// the document balances; `None` while it stays open, and permanently
+    /// (the document is abandoned) when a closing bracket underflows.
+    fn feed<'a>(&mut self, content: &'a str, until: usize) -> Option<(&'a str, usize)> {
+        let bytes = content.as_bytes();
+        for index in self.scan..until {
+            let byte = bytes[index];
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth = self.depth.checked_sub(1)?;
+                    if self.depth == 0 {
+                        self.scan = index + 1;
+                        let after = content[index..]
+                            .find('\n')
+                            .map_or(content.len(), |newline| index + newline + 1);
+                        return Some((&content[self.start..=index], after));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.scan = until;
+        None
+    }
+}
+
+/// Maps a fence info string to the domain that handles it. Only the info
+/// word matters (CommonMark takes the first word as the language); formats
+/// the compressors explicitly support participate, and every other label
+/// protects its block. The info string is decoration around an explicit
+/// boundary, never a host-provided semantic hint the content itself lacks.
+fn region_kind(info: &str) -> Option<RegionKind> {
+    let word = info
+        .trim()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match word.as_str() {
+        "json" => Some(RegionKind::Json),
+        "csv" | "tsv" => Some(RegionKind::Tabular),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(content: &str) -> Vec<(String, RegionKind)> {
+        boundaries(content)
+            .into_iter()
+            .map(|boundary| (boundary.body.to_owned(), boundary.kind))
+            .collect()
+    }
+
+    #[test]
+    fn fences_with_supported_and_unknown_labels_partition_the_scan() {
+        let content = "a\n```json\n{\"x\": 1}\n```\nb\n```csv\n1,2\n3,4\n5,6\n```\nc\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], ("{\"x\": 1}".to_owned(), RegionKind::Json));
+        assert_eq!(found[1], ("1,2\n3,4\n5,6".to_owned(), RegionKind::Tabular));
+    }
+
+    #[test]
+    fn tilde_fences_and_longer_closing_fences_close() {
+        let content = "~~~json starts-here\n{\"x\": 1}\n~~~~~\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "{\"x\": 1}");
+    }
+
+    #[test]
+    fn backtick_info_string_cannot_open_a_fence() {
+        // The line opens no fence, so its body is scanned as ordinary
+        // content: the object line is still a bare JSON region.
+        let content = "```json `quote`\n{\"x\": 1}\n```\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "{\"x\": 1}");
+    }
+
+    #[test]
+    fn bracket_balance_survives_braces_inside_strings() {
+        // One line, one balanced document: the `}` inside the string value
+        // must not close it early, so the whole object is one region.
+        let content = "text\n{\"s\": \"}\"}\nmore\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "{\"s\": \"}\"}");
+    }
+
+    #[test]
+    fn unbalanced_opening_bracket_protects_its_remainder() {
+        // Like an unclosed fence, a bare document that never balances keeps
+        // the rest of the scan window inside it — the state machine that
+        // makes the walk single-pass cannot resume scanning mid-document
+        // without reintroducing a rescan per candidate.
+        let content = "text\n{\"open\": [\nstill prose\n";
+        assert!(kinds(content).is_empty());
+    }
+
+    #[test]
+    fn escaped_quotes_inside_json_strings() {
+        let content = "x\n{\"s\": \"a\\\"}\"}\ny\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "{\"s\": \"a\\\"}\"}");
+    }
+
+    #[test]
+    fn protected_blocks_hide_supported_regions_inside_them() {
+        let content = "```python\nx = 1\n```json fake label\n{\"n\": 1}\n```\n";
+        // The python block swallows everything up to its closing fence.
+        assert!(kinds(content).is_empty());
+    }
+
+    #[test]
+    fn indented_fences_up_to_three_spaces_open() {
+        let content = "   ```json\n{\"x\": 1}\n   ```\n";
+        let found = kinds(content);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "{\"x\": 1}");
+    }
+}

@@ -18,6 +18,7 @@ use tokenless_protocol::{
 
 use super::arbitration::{ArbitrationInput, Verdict, decide};
 use super::content::detect;
+use super::mixed;
 use super::stash_ledger::StashLedger;
 
 /// Policy resolved by Runtime for one PostTool call.
@@ -35,6 +36,7 @@ pub(crate) struct PostToolPipelineConfig {
     pub(crate) force_json: bool,
     pub(crate) allow_toon: bool,
     pub(crate) min_toon_chars: usize,
+    pub(crate) mixed_content_enabled: bool,
     pub(crate) json: JsonCompressionConfig,
 }
 
@@ -126,12 +128,28 @@ impl PostToolPipeline {
                     && path_list_candidate.is_some()))
             && content_type == ContentType::SearchResults
             && request.capabilities.replace_with_text;
+        // Mixed-content routing fires only when no whole-content domain
+        // matched: standalone documents keep their existing routes and
+        // eligibility checks untouched. Per-region compression reuses the
+        // same compressors, arbitration and stash lifecycle as those routes.
+        // Tabular regions are recognized only inside explicit fences (a bare
+        // CSV block has no verifiable boundary); bare regions are JSON only.
+        let mixed_candidate = config.mixed_content_enabled
+            && !diff_candidate
+            && !html_candidate
+            && !json_candidate
+            && !build_log_candidate
+            && !tabular_candidate
+            && !search_candidate
+            && !search_only
+            && request.capabilities.replace_with_text;
         if !diff_candidate
             && !html_candidate
             && !json_candidate
             && !build_log_candidate
             && !tabular_candidate
             && !search_candidate
+            && (!mixed_candidate || !mixed::has_recognizable_regions(&request.content))
         {
             return passthrough(request, before_tokens, content_type);
         }
@@ -299,7 +317,7 @@ impl PostToolPipeline {
                 stash_errors: 0,
                 unrecoverable_truncations: None,
             }
-        } else {
+        } else if tabular_candidate {
             let outcome = TabularCompressor.compress(&request.content);
             DomainCandidate {
                 output: outcome.output,
@@ -315,6 +333,29 @@ impl PostToolPipeline {
                 stash_writes: outcome.stash_writes,
                 stash_errors: outcome.metrics.stash_errors,
                 unrecoverable_truncations: None,
+            }
+        } else {
+            // Mixed-content regions. Region recognition ran inside
+            // `mixed::compress_regions`; every rejected or unsupported region
+            // stays byte-for-byte in the candidate. No applied region means
+            // no candidate — a passthrough, not a no-savings verdict, so
+            // unsupported content keeps the plain route's disposition.
+            match mixed::compress_regions(
+                &request.content,
+                config,
+                attached_store,
+                &request.capabilities.recovery,
+                config.allow_toon && request.capabilities.replace_with_text,
+            ) {
+                Some(outcome) => DomainCandidate {
+                    output: outcome.output,
+                    operations: outcome.operations,
+                    recoverability: outcome.recoverability,
+                    stash_writes: outcome.stash_writes,
+                    stash_errors: outcome.stash_errors,
+                    unrecoverable_truncations: outcome.unrecoverable_truncations,
+                },
+                None => return passthrough(request, before_tokens, content_type),
             }
         };
 
@@ -491,6 +532,7 @@ mod tests {
     include!("tests/tabular_pipeline_tests.rs");
     include!("tests/html_pipeline_tests.rs");
     include!("tests/path_list_pipeline_tests.rs");
+    include!("tests/mixed_pipeline_tests.rs");
     fn search_input() -> String {
         (1..30)
             .map(|line| format!("crates/long_directory/src/search_file.rs:{line}:  value  \r\n"))
@@ -725,6 +767,7 @@ mod tests {
             force_json: true,
             allow_toon: false,
             min_toon_chars: usize::MAX,
+            mixed_content_enabled: false,
             json: JsonCompressionConfig {
                 truncate_arrays_at,
                 array_tail_preserve: 0,
@@ -975,6 +1018,13 @@ mod tests {
         let mut config = config(Duration::from_secs(1), 32);
         config.force_json = false;
         config.require_reversibility = true;
+        config
+    }
+
+    fn mixed_config() -> PostToolPipelineConfig {
+        let mut config = build_log_config();
+        config.force_json = false;
+        config.mixed_content_enabled = true;
         config
     }
 

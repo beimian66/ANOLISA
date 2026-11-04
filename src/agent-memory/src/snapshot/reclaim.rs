@@ -1,4 +1,5 @@
-//! Reclaim orphaned snapshot artefacts under `<mount>/.anolisa/snapshots/`.
+//! Reclaim orphaned snapshot artefacts under `<mount>/.anolisa/snapshots/`,
+//! plus atomic-write staging tempfiles under the meta directory itself.
 //!
 //! Artefact shapes that can accumulate without any code path reclaiming
 //! them:
@@ -33,6 +34,14 @@
 //!    so past the age guard the directory can be removed wholesale —
 //!    via `remove_restore_staging`, since a crashed extraction
 //!    reproduces archived (possibly read-only) directory modes.
+//! 6. `.memory-write-*.tmp` under the meta directory itself —
+//!    `safe_fs::write_atomic` (called by the write and edit tools with the
+//!    meta directory as its staging parent) stages its replacement there
+//!    before publishing, so a hard kill between staging and publication
+//!    leaves one behind. Like `*.partial` it appears in no listing, Git
+//!    status or tar export, so past the age guard it is reclaimed purely
+//!    on age. The main sweep only enumerates `snapshots/`, which is why
+//!    these files need their own pass over the meta directory root.
 //!
 //! The sweeper is age-guarded: an artefact younger than
 //! `min_artifact_age_secs` is never touched, so an in-flight snapshot in
@@ -199,10 +208,13 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
     let _restore_guard = super::tar::restore_lock();
     let mut report = ReclaimReport::default();
     let dir = snapshots_dir(mount);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        // No snapshots directory (or unreadable): nothing to reclaim.
-        Err(_) => return report,
+    // Collect up front: a missing or unreadable snapshots directory only
+    // empties the snapshots sweep — the meta-directory sweep below (rule 6)
+    // must still run, since `write_atomic` stages there even on a mount
+    // that has never taken a snapshot.
+    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.flatten().collect(),
+        Err(_) => Vec::new(),
     };
     let now = std::time::SystemTime::now();
 
@@ -217,7 +229,7 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
     let mut archives = Vec::new();
     let mut sidecars = Vec::new();
     let mut staging_dirs = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
         let file_type = match entry.file_type() {
             Ok(t) => t,
             Err(_) => continue,
@@ -639,6 +651,82 @@ pub fn reclaim_artifacts(mount: &MountPoint, min_age: Duration) -> ReclaimReport
                 tracing::warn!(
                     "snapshot reclaim: could not remove staging dir {}: {e}",
                     staging.display()
+                );
+                report.removal_failures += 1;
+            }
+        }
+    }
+
+    // 6. `.memory-write-*.tmp` under the meta directory itself —
+    //    `write_atomic`'s staging parent for the write/edit tools is the
+    //    meta directory root, one level above `snapshots/`, so the main
+    //    listing above never sees these. Same class as rule 1's `.tmp` arm:
+    //    never referenced by any listing, reclaimed purely on age.
+    //
+    //    SECURITY: the name comes from a directory listing of a
+    //    model-writable parent (the mount root), so the age probe is
+    //    anchored at the root fd and the file-type re-check goes through
+    //    the anchored metadata call — a planted symlink or a name swapped
+    //    in after `read_dir` is never followed or unlinked through the
+    //    absolute path. An unresolvable entry reads as young and is left
+    //    for the next sweep, mirroring the anchored age probe's contract.
+    let meta_rel = Path::new(mount.meta_dir_name());
+    let meta_entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&mount.meta_dir) {
+        Ok(entries) => entries.flatten().collect(),
+        // The meta directory must exist for a live mount; a read failure
+        // here leaves nothing to collect and the sweep ends empty.
+        Err(_) => Vec::new(),
+    };
+    let mut meta_tmps = Vec::new();
+    for entry in meta_entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".memory-write-") && n.ends_with(".tmp"))
+        {
+            meta_tmps.push(entry.path());
+        }
+    }
+    for path in meta_tmps {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let rel = meta_rel.join(&name);
+        if !older_than_anchored(mount.root_fd.as_fd(), &rel, min_age, now) {
+            report.kept_young += 1;
+            continue;
+        }
+        // The anchored metadata call doubles as the regular-file re-check:
+        // a name swapped to a symlink or directory since `read_dir` is
+        // refused (NO_SYMLINKS) or reports a non-file type, and the tmp is
+        // spared rather than unlinked through a hostile target.
+        match crate::safe_fs::metadata(mount.root_fd.as_fd(), &rel) {
+            Ok(meta) if meta.is_file() => {}
+            _ => {
+                report.removal_failures += 1;
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.partials_removed += 1;
+                tracing::info!(
+                    "snapshot reclaim: removed stale atomic-write staging file {}",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "snapshot reclaim: could not remove atomic-write staging file {}: {e}",
+                    path.display()
                 );
                 report.removal_failures += 1;
             }

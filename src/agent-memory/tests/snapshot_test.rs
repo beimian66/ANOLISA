@@ -836,6 +836,64 @@ fn reclaim_removes_readonly_staging_dirs() {
     }
 }
 
+// ---- atomic-write staging tempfiles under the meta directory (#9476) ----
+
+#[test]
+fn reclaim_removes_stale_meta_dir_write_tmp_and_keeps_young() {
+    let (_tmp, svc) = setup();
+    // `write_atomic` stages directly in the meta directory root, one level
+    // above `snapshots/` — plant a crash leftover there, old, and a young
+    // one (a write in flight in another process). An unrelated hidden file
+    // in the same directory must never be touched.
+    let stale = svc.mount.meta_dir.join(".memory-write-OLD.tmp");
+    let young = svc.mount.meta_dir.join(".memory-write-NEW.tmp");
+    let unrelated = svc.mount.meta_dir.join(".other-tool-state");
+    std::fs::write(&stale, b"content").unwrap();
+    std::fs::write(&young, b"content").unwrap();
+    std::fs::write(&unrelated, b"keep").unwrap();
+    age_file(&stale, 2 * 24 * 3600);
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.partials_removed, 1);
+    assert_eq!(report.kept_young, 1);
+    assert!(!stale.exists());
+    assert!(young.exists());
+    assert!(unrelated.exists());
+}
+
+#[test]
+fn reclaim_meta_dir_write_tmp_is_anchored_against_planted_symlink() {
+    let (_tmp, svc) = setup();
+    // A symlink is never a `write_atomic` staging file (tempfile only
+    // creates regular files), and the anchored age probe refuses to
+    // resolve one: the sweep must leave the link — and its target —
+    // completely untouched, removing nothing.
+    let planted = svc.mount.meta_dir.join(".memory-write-EVIL.tmp");
+    let victim_dir = svc.mount.meta_dir.join("snapshots");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, &planted).unwrap();
+    age_file(&planted, 2 * 24 * 3600);
+
+    let report = agent_memory::snapshot::reclaim::reclaim_artifacts(
+        &svc.mount,
+        Duration::from_secs(24 * 3600),
+    );
+    assert_eq!(report.partials_removed, 0);
+    assert_eq!(report.removal_failures, 0);
+    assert!(
+        std::fs::symlink_metadata(&planted).is_ok(),
+        "the planted link itself must survive the refused sweep"
+    );
+    assert!(victim_dir.exists(), "the link target must be untouched");
+    assert!(
+        std::fs::read_dir(&victim_dir).unwrap().count() == 0,
+        "nothing may be deleted through the planted link"
+    );
+}
+
 /// A real (gzip + tar, one regular entry) archive for repair tests: the
 /// shape `create_tarball` writes, small enough to validate quickly.
 fn write_valid_archive(dir: &std::path::Path, id: &str, content: &[u8]) {

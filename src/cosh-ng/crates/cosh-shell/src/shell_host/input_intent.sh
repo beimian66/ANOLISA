@@ -12,6 +12,32 @@ _cosh_ascii_trim() {
   printf '%s' "$value"
 }
 
+# A whole sentence wrapped in one balanced quote pair is a quotation of an
+# English question, not shell syntax the user wants executed: the shell itself
+# would treat the body as a single word and only the quote characters reach the
+# command-not-found handler. Strip the pair only when the input is non-Han,
+# the quotes balance at both ends, and the body contains no quote characters;
+# anything else (including Han input, which the Han branch already scans
+# quote-aware) keeps the original text. The veto still runs on the stripped
+# body, so pipes, redirections, or substitutions inside the quotes stay
+# fail-closed.
+_cosh_unwrap_quoted_sentence() {
+  local value="$1"
+  local quote=""
+  case "$value" in
+    '"'*'"') quote='"' ;;
+    "'"*"'") quote="'" ;;
+    *) return 1 ;;
+  esac
+  local body="${value:1:${#value}-2}"
+  case "$body" in
+    *"'"*|*'"'*) return 1 ;;
+  esac
+  _cosh_utf8_han_status "$body"
+  (( $? == 1 )) || return 1
+  printf '%s' "$body"
+}
+
 _cosh_byte_at() {
   local value="$1"
   local index="$2"
@@ -363,6 +389,11 @@ _cosh_command_veto() {
   local top_han_status="${3:-1}"
   local scan="$input"
   local word name
+  # Locale for the `?` glob probe: the probe must see characters the way the
+  # interactive shell does, so it needs the caller's locale, but this function
+  # may run under the classifier's C override.
+  local _COSH_VETO_CALLER_LC_ALL="${LC_ALL-}"
+  local _COSH_VETO_CALLER_LANG="${LANG-}"
 
   case "$top_token" in
     /*|*/*|'~/'*|command|env|sudo|exec|nohup|time|xargs)
@@ -442,8 +473,60 @@ _cosh_command_veto() {
     return 1
   fi
 
+  # A `?` in a non-Han line is an English question mark unless its word really
+  # globs to files, in which case the shell has already rewritten the line and
+  # the classifier must not claim it. That mirrors the expansion guard's probe
+  # from #9588. A run of two or more question marks keeps the blanket veto: a
+  # multi-character glob pattern is plausible command syntax, and unlike a
+  # single `?` its verdict would depend on the files in the working directory.
+  # The `？` fullwidth mark stays a blanket rejection here; the Han branch
+  # above never reaches this point. Every other metacharacter, including any
+  # quote character, stays a blanket rejection: quoting around English prose
+  # is shell syntax this fail-closed branch does not interpret.
+  local veto_word_start=0
+  local veto_length="${#scan}"
+  local veto_index=0
+  local veto_run=0
+  # The entry strip removed one trailing `?` from the original line. If the
+  # original ended with a run (`??`), the strip hides one mark and spaces
+  # reset the counter below, so detect the run on the original line instead.
+  case "$input" in
+    *'??'|*'？？'|*'?'*'？'|*'？'*'?'|*'？？？')
+      return 0
+      ;;
+    *'?')
+      if [[ "$scan" == *'?' ]]; then
+        return 0
+      fi
+      ;;
+  esac
+  while (( veto_index < veto_length )); do
+    byte="${scan:$veto_index:1}"
+    (( veto_index += 1 ))
+    case "$byte" in
+      ' '|$'\t')
+        veto_word_start=$veto_index
+        veto_run=0
+        ;;
+      '?')
+        (( veto_run += 1 ))
+        if (( veto_run >= 2 )); then
+          return 0
+        fi
+        if ! _cosh_word_globs_to_files "${scan:$veto_word_start:$((veto_index - veto_word_start))}" \
+             "$_COSH_VETO_CALLER_LC_ALL" "$_COSH_VETO_CALLER_LANG"; then
+          continue
+        fi
+        return 0
+        ;;
+      *)
+        veto_run=0
+        ;;
+    esac
+  done
+
   case "$scan" in
-    *"'"*|*'"'*|*'\'*|*'|'*|*'&'*|*';'*|*'<'*|*'>'*|*'$'*|*'`'*|*'('*|*')'*|*'{'*|*'}'*|*'['*|*']'*|*'*'*|*'?'*|*'？'*|*'~'*|*[[:cntrl:]]*)
+    *"'"*|*'"'*|*'\'*|*'|'*|*'&'*|*';'*|*'<'*|*'>'*|*'$'*|*'`'*|*'('*|*')'*|*'{'*|*'}'*|*'['*|*']'*|*'*'*|*'？'*|*'~'*|*[[:cntrl:]]*)
       return 0
       ;;
   esac
@@ -501,6 +584,23 @@ _cosh_classify_missing() {
   if (( top_han_status == 2 )); then
     printf '%s' "unsafe"
     return 0
+  fi
+
+  # A whole sentence wrapped in one balanced quote pair is a quoted English
+  # question. The veto's non-Han branch is fail-closed on any quote character,
+  # so strip the wrapper before it runs; the veto still sees the body, and the
+  # guard above has already proven the line carries no unquoted expansion.
+  local unwrapped
+  if unwrapped="$(_cosh_unwrap_quoted_sentence "$original")"; then
+    original="$unwrapped"
+    _cosh_utf8_han_status "$original"
+    original_han_status=$?
+    if (( original_han_status == 2 )); then
+      printf '%s' "unsafe"
+      return 0
+    fi
+    _cosh_utf8_han_status "$top_token"
+    top_han_status=$?
   fi
 
   if _cosh_command_veto "$original" "$top_token" "$top_han_status"; then

@@ -706,3 +706,83 @@ fn routing_c1_classifier_validates_full_utf8_before_han() {
         );
     }
 }
+
+#[test]
+fn routing_c1_classifier_routes_mid_sentence_english_questions() {
+    for (input, top_token) in [
+        (
+            "What is 6 multiplied by 7? Reply with only the number.",
+            "What",
+        ),
+        ("What is the meaning of this?", "What"),
+        ("Can you explain? thanks", "Can"),
+        ("Is this safe? tell me", "Is"),
+        ("What is that number multiplied by 2?", "What"),
+    ] {
+        assert_bash_zsh(input, top_token, "natural_language");
+    }
+}
+
+#[test]
+fn routing_c1_classifier_routes_whole_quoted_english_questions() {
+    for (input, top_token) in [
+        (
+            "\"What is 6 multiplied by 7? Reply with only the number.\"",
+            "\"What",
+        ),
+        ("'What is 6 multiplied by 7?'", "'What"),
+        ("\"What is the meaning of this?\"", "\"What"),
+    ] {
+        assert_bash_zsh(input, top_token, "natural_language");
+    }
+}
+
+#[test]
+fn routing_c1_classifier_keeps_multi_question_globs_shell_owned() {
+    for (input, top_token) in [("Who are you??", "Who"), ("review *.log??", "review")] {
+        assert_bash_zsh(input, top_token, "command");
+    }
+}
+
+#[test]
+fn routing_c1_classifier_keeps_quoted_command_syntax_shell_owned() {
+    for (input, top_token) in [
+        ("\"review this | cat\"", "\"review"),
+        ("\"help me; do stuff\"", "\"help"),
+        ("\"review output > file\"", "\"review"),
+        ("\"review `printf x`\"", "\"review"),
+        ("\"review $(printf x)\"", "\"review"),
+        ("\"unterminated", "\"unterminated"),
+        ("\"mixed 'quotes' stay\"", "\"mixed"),
+    ] {
+        assert_bash_zsh(input, top_token, "command");
+    }
+}
+
+#[test]
+fn routing_c1_classifier_veto_single_question_globs_to_files() {
+    let dir = std::env::temp_dir().join(format!("cosh-veto-glob-{}", super::unique_suffix()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("why1"), b"x").expect("write fixture");
+    for shell in ["bash", "zsh"] {
+        if !shell_available(shell) {
+            continue;
+        }
+        // The shell would rewrite the mid-sentence `?` in `why? logs` into a
+        // filename before command-not-found runs, so the classifier must not
+        // claim the literal line.
+        let setup = format!("cd {}", dir.display());
+        assert_eq!(
+            classify_with_setup(shell, "review why? logs", "review", &setup).as_deref(),
+            Some("command"),
+            "{shell}: a globbing question mark must stay shell-owned"
+        );
+        // Without a matching file the same line is an English question.
+        assert_eq!(
+            classify(shell, "review why? logs", "review").as_deref(),
+            Some("natural_language"),
+            "{shell}: an unmatched single question mark is a question"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

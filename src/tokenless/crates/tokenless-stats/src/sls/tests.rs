@@ -307,15 +307,14 @@ fn test_resolve_sls_path_rejects_non_whitelisted_prefix() {
 #[test]
 #[cfg(unix)]
 fn test_resolve_sls_path_accepts_valid_path() {
-    // Valid paths under /var/log/ or /tmp/ are accepted.
-    assert_eq!(
-        resolve_sls_path(Some("/var/log/custom/tokenless.jsonl")),
-        PathBuf::from("/var/log/custom/tokenless.jsonl")
-    );
-    assert_eq!(
-        resolve_sls_path(Some("/tmp/tokenless-test.jsonl")),
-        PathBuf::from("/tmp/tokenless-test.jsonl")
-    );
+    // Valid paths under /var/log/ or /tmp/ are accepted. On macOS the
+    // canonicalized form gains the /private prefix (/var → /private/var,
+    // /tmp → /private/tmp), so assert on the prefix instead of the exact
+    // resolved path.
+    let var = resolve_sls_path(Some("/var/log/custom/tokenless.jsonl"));
+    assert!(var.starts_with("/var/log/") || var.starts_with("/private/var/log/"));
+    let tmp = resolve_sls_path(Some("/tmp/tokenless-test.jsonl"));
+    assert!(tmp.starts_with("/tmp/") || tmp.starts_with("/private/tmp/"));
 }
 
 #[test]
@@ -332,7 +331,9 @@ fn test_validate_sls_path_symlinked_prefix() {
     ));
     assert!(result.is_some());
     let resolved = result.unwrap();
-    assert!(resolved.to_str().unwrap().starts_with("/var/log/"));
+    let resolved_str = resolved.to_str().unwrap();
+    // macOS canonicalizes /var to /private/var.
+    assert!(resolved_str.starts_with("/var/log/") || resolved_str.starts_with("/private/var/log/"));
 }
 
 #[test]

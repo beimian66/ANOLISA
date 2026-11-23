@@ -46,6 +46,8 @@ impl TempDbGuard {
             .join(format!("tokenless-test-{nanos}"))
             .to_string_lossy()
             .into_owned();
+        // /tmp canonicalizes to /private/tmp on macOS, so also allow the
+        // canonicalized prefix when validating the override path.
         #[cfg(unix)]
         let sls_dir = format!("/tmp/tokenless-sls-test-{nanos}");
         #[cfg(windows)]

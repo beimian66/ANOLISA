@@ -32,14 +32,17 @@ pub const DEFAULT_SLS_PATH: &str = "/var/log/anolisa/sls/ops/tokenless.jsonl";
 /// Allowed path prefixes for TOKENLESS_SLS_PATH env var override.
 /// NOTE: /tmp/ is world-writable on most Unix systems — other local users
 /// can read the JSONL file if placed there. Prefer /var/log/ for production.
-const ALLOWED_SLS_PREFIXES: &[&str] = &["/var/log/", "/tmp/"];
+/// The /private/ variants cover macOS, where /tmp and /var are symlinks
+/// into /private and canonicalization rewrites the prefix.
+const ALLOWED_SLS_PREFIXES: &[&str] = &["/var/log/", "/tmp/", "/private/var/log/", "/private/tmp/"];
 
 /// Root-owned prefixes where creating a symlink requires privilege. For
 /// these, the original (pre-canonicalize) path can be trusted even when
 /// canonicalization resolves it elsewhere (e.g. `/var/log` symlinked to
 /// another filesystem). World-writable prefixes like `/tmp/` are excluded
 /// because an unprivileged user can place a symlink there to escape.
-const TRUSTED_SLS_PREFIXES: &[&str] = &["/var/log/"];
+/// `/private/var/log` is the macOS canonicalized form of `/var/log`.
+const TRUSTED_SLS_PREFIXES: &[&str] = &["/var/log/", "/private/var/log/"];
 
 /// Canonicalize a path, walking up the parent chain to resolve symlinks
 /// when the path or its ancestors don't exist yet. Returns the best-effort

@@ -2321,7 +2321,9 @@ fn diff_defaults_on_and_round_trips_git_patch_and_original() {
         });
         // With quotePath=false these bytes are emitted raw, outside the
         // text input accepted by the compression API.
-        #[cfg(unix)]
+        // APFS rejects non-UTF-8 filenames at the VFS layer, so this
+        // fixture only applies to Linux; macOS would fail the write.
+        #[cfg(all(unix, target_os = "linux"))]
         {
             use std::os::unix::ffi::OsStringExt;
             if quote_path == "true" {
@@ -3192,8 +3194,16 @@ fn assert_stalled_rewrite_ends_with_git(caller: StalledCaller) {
         "{elapsed:?}: {stderr}"
     );
     if caller == StalledCaller::ChildBehindFullStderr {
-        // The child kills its whole group, itself included.
-        assert_eq!(status.signal(), Some(libc::SIGKILL), "{stderr}");
+        // The child kills its whole group, itself included. On multithreaded
+        // Darwin processes, the `process::exit(1)` after `tree.kill()` can
+        // win the race and end the process before SIGKILL is delivered, so
+        // accept either termination.
+        let killed_by_group = status.signal() == Some(libc::SIGKILL);
+        let exited_after_report = status.code() == Some(1);
+        assert!(
+            killed_by_group || exited_after_report,
+            "{status:?}: {stderr}"
+        );
     } else {
         assert_eq!(status.code(), Some(1), "{status:?}: {stderr}");
     }
@@ -3461,7 +3471,12 @@ fn rewrite_child_ends_at_its_deadline_while_its_response_cannot_be_written() {
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}: {stderr}");
+    // On multithreaded Darwin processes, the `process::exit(1)` after
+    // `tree.kill()` can win the race and end the process before SIGKILL
+    // is delivered, so accept either termination.
+    let killed = status.signal() == Some(libc::SIGKILL);
+    let exited = status.code() == Some(1);
+    assert!(killed || exited, "{status:?}: {stderr}");
     assert!(
         (Duration::from_secs(5)..Duration::from_secs(8)).contains(&elapsed),
         "{elapsed:?}: {stderr}"

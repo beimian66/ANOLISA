@@ -636,7 +636,8 @@ fn check_config_file_tilde_expansion() {
 }
 
 // Legacy readiness checks require Unix tools or filesystem layouts.
-#[cfg(unix)]
+// The file_read probe reads /proc/self/status, which only Linux exposes.
+#[cfg(target_os = "linux")]
 #[test]
 fn check_permission_file_read() {
     assert!(check_permission("file_read"));
@@ -731,7 +732,8 @@ fn normalize_dep_object_with_apt_apk_packages() {
 }
 
 // Legacy readiness checks require Unix tools or filesystem layouts.
-#[cfg(unix)]
+// The file_read permission probe reads /proc/self/status, only on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn check_tool_all_ready() {
     let spec = ToolDepSpec {

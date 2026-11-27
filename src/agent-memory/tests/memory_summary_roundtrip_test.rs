@@ -191,3 +191,57 @@ fn import_normalized_control_characters_remain_single_summary_entries() {
         archive = memory_export(&destination, &ExportFilter::default()).unwrap();
     }
 }
+
+#[test]
+fn recent_memories_order_and_limits_match_a_full_sort() {
+    let (_dir, svc) = service();
+    // Written in scan order: a1/a2/a3 share one timestamp (the stable full
+    // sort must keep their scan order), b1 is older, and one note has no
+    // created_at at all (empty string sorts last).
+    let notes = [
+        ("notes/a1.md", "2026-01-02T00:00:00Z"),
+        ("notes/a2.md", "2026-01-02T00:00:00Z"),
+        ("notes/a3.md", "2026-01-02T00:00:00Z"),
+        ("notes/b1.md", "2026-01-01T00:00:00Z"),
+        ("notes/c1.md", ""),
+    ];
+    for (path, created_at) in notes {
+        let stamp = if created_at.is_empty() {
+            String::new()
+        } else {
+            format!("\ncreated_at: {created_at}")
+        };
+        svc.write(
+            path,
+            &format!("---\ntitle: \"{path}\"{stamp}\n---\nBody\n"),
+            false,
+        )
+        .unwrap();
+    }
+
+    let paths = |summary: &MemorySummary| -> Vec<String> {
+        summary
+            .recent_memories
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    };
+
+    // Limit above the store size keeps everything in descending order with
+    // equal timestamps in scan order and missing timestamps last.
+    let all = memory_summary(&svc, 10).unwrap();
+    assert_eq!(
+        paths(&all),
+        ["notes/a1.md", "notes/a2.md", "notes/a3.md", "notes/b1.md", "notes/c1.md"]
+    );
+
+    // Small limits take the newest prefix of that order.
+    assert_eq!(paths(&memory_summary(&svc, 3).unwrap()), ["notes/a1.md", "notes/a2.md", "notes/a3.md"]);
+    assert_eq!(paths(&memory_summary(&svc, 1).unwrap()), ["notes/a1.md"]);
+
+    // Zero limit retains no recent entries but keeps the aggregates.
+    let none = memory_summary(&svc, 0).unwrap();
+    assert!(none.recent_memories.is_empty());
+    assert_eq!(none.total_memories, 5);
+    assert_eq!(none.by_category.len(), 1);
+}

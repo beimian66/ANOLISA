@@ -4,7 +4,8 @@
 //! what the system remembers, how memories were created (auto vs manual),
 //! and which topics/categories dominate.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -105,7 +106,18 @@ pub fn memory_summary(svc: &MemoryService, recent_limit: usize) -> Result<Memory
 
     let mut concept_counts: HashMap<String, usize> = HashMap::new();
     let mut file_counts: HashMap<String, usize> = HashMap::new();
-    let mut all_entries: Vec<(String, MemorySummaryEntry)> = Vec::new(); // (created_at, entry)
+    // Bounded Top-K selection of recent entries. The heap holds the K entries
+    // that the previous full `sort_by(created_at descending)` + `take(K)`
+    // would have kept. Each key is `Reverse((created_at, scan index))`: the
+    // heap root is the current minimum, and the scan index breaks timestamp
+    // ties so that earlier-scanned entries win (Rust's `sort_by` is stable),
+    // while missing timestamps (empty string) sort last exactly as before.
+    // The entry itself is not part of the ordering key.
+    let mut recent_heap: BinaryHeap<
+        Reverse<(String, usize)>,
+    > = BinaryHeap::new();
+    let mut recent_entries: HashMap<usize, MemorySummaryEntry> = HashMap::new();
+    let mut recent_scan_index: usize = 0;
 
     for dir_entry in WalkDir::new(&svc.mount.root)
         .follow_links(false)
@@ -187,25 +199,48 @@ pub fn memory_summary(svc: &MemoryService, recent_limit: usize) -> Result<Memory
         let created_at = fm.get("created_at").cloned().unwrap_or_default();
         let title = fm.get("title").cloned().unwrap_or_else(|| rel_path.clone());
 
-        all_entries.push((
-            created_at.clone(),
-            MemorySummaryEntry {
-                path: rel_path,
-                title,
-                category,
-                source,
-                created_at,
-            },
-        ));
+        let key = Reverse((created_at.clone(), recent_scan_index));
+        if recent_heap.len() < recent_limit {
+            recent_heap.push(key);
+            recent_entries.insert(
+                recent_scan_index,
+                MemorySummaryEntry {
+                    path: rel_path,
+                    title,
+                    category,
+                    source,
+                    created_at,
+                },
+            );
+        } else if recent_limit > 0 && key > *recent_heap.peek().unwrap() {
+            // This entry sorts after the current minimum of the kept set, so
+            // evict that minimum and keep this one instead.
+            let Reverse(evicted) = recent_heap.pop().unwrap();
+            recent_entries.remove(&evicted.1);
+            recent_heap.push(key);
+            recent_entries.insert(
+                recent_scan_index,
+                MemorySummaryEntry {
+                    path: rel_path,
+                    title,
+                    category,
+                    source,
+                    created_at,
+                },
+            );
+        }
+        recent_scan_index += 1;
     }
 
-    // Sort by created_at descending, take top N
-    all_entries.sort_by(|a, b| b.0.cmp(&a.0));
-    summary.recent_memories = all_entries
+    let mut selected: Vec<(Reverse<(String, usize)>, MemorySummaryEntry)> = recent_heap
         .into_iter()
-        .take(recent_limit)
-        .map(|(_, entry)| entry)
+        .filter_map(|key| recent_entries.remove(&key.0 .1).map(|entry| (key, entry)))
         .collect();
+    // Descending created_at with earlier scan index first on ties — the same
+    // order a stable `sort_by(|a, b| b.0.cmp(&a.0))` over the full scan
+    // produced.
+    selected.sort_by(|a, b| b.0 .0.cmp(&a.0 .0).then_with(|| a.0 .0 .1.cmp(&b.0 .0 .1)));
+    summary.recent_memories = selected.into_iter().map(|(_, entry)| entry).collect();
 
     // Top concepts (sorted by count descending)
     let mut concepts: Vec<(String, usize)> = concept_counts.into_iter().collect();
